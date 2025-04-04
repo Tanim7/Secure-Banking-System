@@ -3,15 +3,16 @@ import threading
 import json
 import logging
 import bcrypt
-from cryptography.fernet import Fernet
 from datetime import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 import base64
 import hashlib
+import hmac
+import os
 
 bank_server_key = "key"
-# cipher = Fernet(bank_server_key)
+psk = b"key"  
 
 customers = {
     "timmy ngo": {
@@ -64,6 +65,17 @@ def decrypt(encrypted_message):
         print(f"[ERROR] Decryption failed: {e}")
         return ""
     
+def hmac_sha256(key: bytes, msg: bytes):
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+def generate_nonce():
+    return os.urandom(16)
+
+def to_b64(data):
+    return base64.b64encode(data).decode()
+
+def from_b64(data):
+    return base64.b64decode(data)
 
 def log_audit(customer_id, action):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -202,5 +214,120 @@ def start_server():
         thread.start()
         print(f"[ACTIVE CONNECTIONS] {threading.active_count() - 1}")
 
+def connect_to_server(request):
+    host = 'localhost'
+    port = 5555
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.connect((host, port))
+
+        encrypted_request = encrypt(json.dumps(request))
+        client.send(encrypted_request.encode())
+
+        encrypted_response = client.recv(1024).decode()
+        decrypted_response = decrypt(encrypted_response)
+        return json.loads(decrypted_response)
+
+def run_key_exchange(client_socket, username):
+    print("\n[AKDP] Initiating authenticated key distribution...")
+
+    # Step 1: Generate nonce1
+    nonce1 = generate_nonce()
+    print(f"[CLIENT → SERVER] Sending nonce1: {to_b64(nonce1)}")
+    request = {
+        "action": "akdp_step1",
+        "username": username,
+        "nonce1": to_b64(nonce1)
+    }
+    client_socket.send(encrypt(json.dumps(request)).encode())
+
+    # Step 2: Receive server response
+    response = json.loads(decrypt(client_socket.recv(1024).decode()))
+    nonce2 = from_b64(response["nonce2"])
+    server_hmac = from_b64(response["server_hmac"])
+
+    print(f"[SERVER → CLIENT] Received nonce2: {response['nonce2']}")
+    print(f"[SERVER → CLIENT] Received HMAC: {response['server_hmac']}")
+
+    # Validate server HMAC
+    expected_hmac = hmac_sha256(psk, nonce1 + nonce2 + b"SERVER")
+    if server_hmac != expected_hmac:
+        print("Server authentication failed!")
+        return None
+
+    print("Server authenticated successfully.")
+
+    # Step 3: Confirm and compute master secret
+    master_secret = hmac_sha256(psk, nonce1 + nonce2)
+    confirm_hmac = hmac_sha256(master_secret, b"CONFIRM")
+    print("[CLIENT] Sending confirmation HMAC...")
+
+    confirm_request = {
+        "action": "akdp_confirm",
+        "username": username,
+        "client_hmac": to_b64(confirm_hmac)
+    }
+    client_socket.send(encrypt(json.dumps(confirm_request)).encode())
+
+    print("AKDP complete. Master Secret established.")
+    print(f"Master Secret (hex): {master_secret.hex()}\n")
+    return master_secret
+
+
+
 if __name__ == "__main__":
-    start_server()
+    host = 'localhost'
+    port = 5555
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.connect((host, port))
+
+        def send_request(data):
+            encrypted = encrypt(json.dumps(data))
+            client.send(encrypted.encode())
+            response = decrypt(client.recv(1024).decode())
+            return json.loads(response)
+
+        #Login
+        login_request = {
+            "action": "login",
+            "username": "timmy ngo",
+            "password": "123"
+        }
+
+        login_response = send_request(login_request)
+        print("Login:", login_response)
+
+        #Run AKDP 
+        if login_response["status"] == "success":
+            master_secret = run_key_exchange(client, "timmy ngo")
+
+            if master_secret is None:
+                print("AKDP failed. Exiting.")
+                exit()
+
+            #Proceed to transaction menu after AKDP
+            while True:
+                print("\nOptions:\n1. Deposit\n2. Withdraw\n3. Check Balance\n4. Exit")
+                choice = input("Choose action: ")
+
+                if choice == "1":
+                    amount = float(input("Enter deposit amount: "))
+                    response = send_request({"action": "deposit", "username": "timmy ngo", "amount": amount})
+                    print(response)
+
+                elif choice == "2":
+                    amount = float(input("Enter withdrawal amount: "))
+                    response = send_request({"action": "withdraw", "username": "timmy ngo", "amount": amount})
+                    print(response)
+
+                elif choice == "3":
+                    response = send_request({"action": "check_balance", "username": "timmy ngo"})
+                    print(response)
+
+                elif choice == "4":
+                    print("Goodbye.")
+                    break
+
+                else:
+                    print("Invalid option.")
