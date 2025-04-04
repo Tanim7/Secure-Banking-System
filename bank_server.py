@@ -3,6 +3,7 @@ import threading
 import json
 import logging
 import bcrypt
+from cryptography.fernet import Fernet
 from datetime import datetime
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
@@ -12,12 +13,25 @@ import hmac
 import os
 
 bank_server_key = "key"
+# cipher = Fernet(bank_server_key)
 psk = b"key"
-handshake_state = {}  
+handshake_state = {}
+
+def hmac_sha256(key: bytes, msg: bytes):
+    return hmac.new(key, msg, hashlib.sha256).digest()
+
+def generate_nonce():
+    return os.urandom(16)
+
+def to_b64(data):
+    return base64.b64encode(data).decode()
+
+def from_b64(data):
+    return base64.b64decode(data)
 
 customers = {
     "timmy ngo": {
-        "password": "123",
+        "password": bcrypt.hashpw("123".encode(), bcrypt.gensalt()).decode(),
         "balance": 1000,
         "transactions": ["deposit 100", "withdraw 20"]
     }
@@ -65,18 +79,7 @@ def decrypt(encrypted_message):
     except Exception as e:
         print(f"[ERROR] Decryption failed: {e}")
         return ""
-
-def hmac_sha256(key: bytes, msg: bytes):
-    return hmac.new(key, msg, hashlib.sha256).digest()
-
-def generate_nonce():
-    return os.urandom(16)
-
-def to_b64(data):
-    return base64.b64encode(data).decode()
-
-def from_b64(data):
-    return base64.b64decode(data)
+    
 
 def log_audit(customer_id, action):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -103,9 +106,18 @@ def handle_client(conn, addr):
                 print(f"[DISCONNECTED] {addr} disconnected.")
                 break
 
-            print(f"[RECEIVED] {data} from {addr}")
+            print(f"[RECEIVED] {repr(data)} from {addr}")
 
+            # Decrypt data to parse the JSON
             decrypted_data = decrypt(data)
+            if not decrypted_data:
+                print(f"[ERROR] Failed to decrypt data from {addr}.")
+                conn.send(encrypt(json.dumps({"status": "fail", "message": "Decryption failed."})).encode())
+                return
+            
+            print(f"[DECRYPTED] {repr(decrypted_data)} from {addr}")
+
+            # Parse the incoming JSON data
             request = json.loads(decrypted_data)
             action = request.get("action")
             username = request.get("username")
@@ -114,7 +126,10 @@ def handle_client(conn, addr):
             response = handle_action(action, username, password, request)
             response_message = json.dumps(response)
             encrypted_response = encrypt(response_message)
-            conn.send(encrypted_response.encode()) 
+
+            print(f"[SENDING] {repr(encrypted_response)} to {addr}")
+
+            conn.send(encrypted_response.encode())
     except Exception as e:
         print(f"[ERROR] {e}")
     finally:
@@ -136,11 +151,8 @@ def handle_action(action, username, password, request):
         nonce2 = generate_nonce()
         handshake_state[username] = {"nonce1": nonce1, "nonce2": nonce2}
         server_hmac = hmac_sha256(psk, nonce1 + nonce2 + b"SERVER")
-        print(f"\n[AKDP] Step 1 received from {username}")
-        print(f"[CLIENT] nonce1: {request['nonce1']}")
-        print(f"[SERVER] nonce2: {to_b64(nonce2)}")
-        print(f"[SERVER] server_hmac: {to_b64(server_hmac)}\n")
 
+        print(f"[AKDP] Step 1 from {username}")
         return {
             "action": "akdp_step2",
             "nonce2": to_b64(nonce2),
@@ -151,20 +163,18 @@ def handle_action(action, username, password, request):
         client_hmac = from_b64(request["client_hmac"])
         state = handshake_state.get(username)
         if not state:
-            return {"status": "fail", "message": "Handshake state missing"}
+            return {"status": "fail", "message": "Missing handshake"}
 
         nonce1, nonce2 = state["nonce1"], state["nonce2"]
         master_secret = hmac_sha256(psk, nonce1 + nonce2)
-        expected_hmac = hmac_sha256(master_secret, b"CONFIRM")
+        expected = hmac_sha256(master_secret, b"CONFIRM")
 
-        print(f"[SERVER] Verifying client HMAC for {username}...")
-        if client_hmac != expected_hmac:
-            print("Client authentication failed!")
-            return {"status": "fail", "message": "Client authentication failed"}
+        if client_hmac != expected:
+            return {"status": "fail", "message": "Client verification failed"}
 
-        print("Client authenticated successfully.")
-        print(f"Master Secret (hex): {master_secret.hex()}\n")
+        print(f"[AKDP] Key exchange complete for {username}")
         return {"status": "success", "message": "Key exchange complete"}
+
     else:
         logging.error(f"Unknown action: {action}")
         return {"status": "fail", "message": "Unknown action."}
@@ -186,7 +196,7 @@ def handle_register(username, password):
 def handle_login(username, password):
     with lock:
         logging.info(f"Login attempt for user: {username}")
-        if username in customers and customers[username]["password"] == password:
+        if username in customers and verify_hash(password, customers[username]["password"]):
             logging.info(f"User {username} logged in successfully.")
             return {"status": "success", "message": "Login successful."}
         logging.warning(f"Failed login attempt for user: {username}")
